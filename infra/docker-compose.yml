@@ -1,0 +1,124 @@
+services:
+  kafka:
+    image: apache/kafka:latest
+    container_name: ticketforge-kafka
+    pull_policy: always
+    restart: unless-stopped
+    ports:
+      - "9092:9094"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: INTERNAL://:9092,EXTERNAL://:9094,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    healthcheck:
+      test: [ "CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - ticketforge
+
+  booking-db:
+    image: postgres:latest
+    container_name: ticketforge-booking-db
+    pull_policy: always
+    restart: unless-stopped
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: booking_db
+      POSTGRES_USER: ticketforge
+      POSTGRES_PASSWORD: ticketforge
+    volumes:
+      - booking-db-data:/var/lib/postgresql
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ticketforge -d booking_db" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ticketforge
+
+  inventory-db:
+    image: postgres:latest
+    container_name: ticketforge-inventory-db
+    pull_policy: always
+    restart: unless-stopped
+    ports:
+      - "5434:5432"
+    environment:
+      POSTGRES_DB: inventory_db
+      POSTGRES_USER: ticketforge
+      POSTGRES_PASSWORD: ticketforge
+    volumes:
+      - inventory-db-data:/var/lib/postgresql
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ticketforge -d inventory_db" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ticketforge
+
+  payment-db:
+    image: postgres:latest
+    container_name: ticketforge-payment-db
+    pull_policy: always
+    restart: unless-stopped
+    ports:
+      - "5435:5432"
+    environment:
+      POSTGRES_DB: payment_db
+      POSTGRES_USER: ticketforge
+      POSTGRES_PASSWORD: ticketforge
+    volumes:
+      - payment-db-data:/var/lib/postgresql
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ticketforge -d payment_db" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ticketforge
+
+  redis:
+    image: redis:latest
+    container_name: ticketforge-redis
+    pull_policy: always
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ticketforge
+
+networks:
+  ticketforge:
+    name: ticketforge
+    driver: bridge
+
+volumes:
+  booking-db-data:
+    name: ticketforge-booking-db-data
+  inventory-db-data:
+    name: ticketforge-inventory-db-data
+  payment-db-data:
+    name: ticketforge-payment-db-data
+  redis-data:
+    name: ticketforge-redis-data
