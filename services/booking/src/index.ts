@@ -27,7 +27,7 @@ app.post("/test/reserve-seats", async (_req, res) => {
         type: "ReserveSeats",
         bookingId: "booking-123",
         eventId: "event-1",
-        seatNos: ["A1", "A2"],
+        seatNos: ["A1", "A3"],
     };
 
     try {
@@ -69,13 +69,21 @@ async function main() {
             const value = message.value?.toString();
 
             if (!value) return;
+            const event = JSON.parse(value);
 
-            console.log("Received inventory event:", {
-                topic,
-                partition,
-                offset: message.offset,
-                value: JSON.parse(value),
-            });
+            if (event.type === "SeatsReserved") {
+                console.log("Booking can proceed: seats reserved", {
+                    bookingId: event.bookingId,
+                    seatNos: event.seatNos,
+                });
+            } else if (event.type === "SeatsReservationFailed") {
+                console.log("Booking cannot proceed: seat reservation failed", {
+                    bookingId: event.bookingId,
+                    reason: event.reason,
+                });
+            } else {
+                console.log("Unknown inventory event:", event);
+            }
         },
     });
 

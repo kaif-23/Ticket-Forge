@@ -12,3 +12,11 @@ export interface SeatsReservedEvent {
     eventId: string;
     seatNos: string[];
 }
+
+export interface SeatsReservationFailedEvent {
+    type: "SeatsReservationFailed";
+    bookingId: string;
+    eventId: string;
+    seatNos: string[];
+    reason: "SEAT_UNAVAILABLE";
+}
