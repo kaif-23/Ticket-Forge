@@ -1,10 +1,12 @@
-import express from "express";
 import { Kafka } from "kafkajs";
 import type { ReserveSeatsCommand } from "../../../packages/common/src/messages.js";
-const app = express();
-const PORT = 3001;
+import {
+    applyInventoryOutcome,
+    InvalidInventoryEventError,
+} from "./bookingEvents.js";
+import { createBookingApp } from "./bookingApi.js";
 
-app.use(express.json());
+const PORT = Number(process.env.BOOKING_HTTP_PORT ?? 3001);
 
 const kafka = new Kafka({
     clientId: "ticketforge-booking",
@@ -15,15 +17,21 @@ const producer = kafka.producer();
 const consumer = kafka.consumer({
     groupId: "booking-service-group",
 });
-app.get("/health", (_req, res) => {
-    res.status(200).json({
-        service: "booking",
-        status: "ok",
+
+const app = createBookingApp(async (command) => {
+    await producer.send({
+        topic: "inventory.commands",
+        messages: [
+            {
+                key: command.bookingId,
+                value: JSON.stringify(command),
+            },
+        ],
     });
 });
 
 app.post("/test/reserve-seats", async (_req, res) => {
-    const command :ReserveSeatsCommand = {
+    const command: ReserveSeatsCommand = {
         type: "ReserveSeats",
         bookingId: "booking-123",
         eventId: "event-1",
@@ -64,32 +72,60 @@ async function main() {
         fromBeginning: true,
     });
 
+    app.listen(PORT, () => {
+        console.log(`Booking Service running on port ${PORT}`);
+    });
+
     await consumer.run({
         eachMessage: async ({ topic, partition, message }) => {
             const value = message.value?.toString();
 
             if (!value) return;
-            const event = JSON.parse(value);
 
-            if (event.type === "SeatsReserved") {
-                console.log("Booking can proceed: seats reserved", {
-                    bookingId: event.bookingId,
-                    seatNos: event.seatNos,
+            let event: unknown;
+            try {
+                event = JSON.parse(value);
+            } catch {
+                console.error("Invalid Inventory event JSON; skipping message", {
+                    topic,
+                    partition,
+                    offset: message.offset,
                 });
-            } else if (event.type === "SeatsReservationFailed") {
-                console.log("Booking cannot proceed: seat reservation failed", {
-                    bookingId: event.bookingId,
-                    reason: event.reason,
+                return;
+            }
+
+            try {
+                const outcome = await applyInventoryOutcome(event);
+
+                if (outcome.kind === "updated") {
+                    console.log("Persisted Inventory outcome:", outcome);
+                } else if (outcome.kind === "unknown") {
+                    console.warn("Inventory event references an unknown booking:", outcome);
+                } else {
+                    console.warn("Ignored stale Inventory outcome:", outcome);
+                }
+            } catch (error) {
+                if (error instanceof InvalidInventoryEventError) {
+                    console.error("Invalid Inventory event; skipping message", {
+                        topic,
+                        partition,
+                        offset: message.offset,
+                        error: error.message,
+                    });
+                    return;
+                }
+
+                console.error("Failed to persist Inventory outcome:", {
+                    topic,
+                    partition,
+                    offset: message.offset,
+                    error,
                 });
-            } else {
-                console.log("Unknown inventory event:", event);
+                throw error;
             }
         },
     });
 
-    app.listen(PORT, () => {
-        console.log(`Booking Service running on port ${PORT}`);
-    });
 }
 
 

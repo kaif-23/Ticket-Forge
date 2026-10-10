@@ -6,6 +6,10 @@ const eventId = `test-event-${Date.now()}`;
 
 async function main() {
     await pool.query(
+        "INSERT INTO events (id, name) VALUES ($1, $1)",
+        [eventId],
+    );
+    await pool.query(
         `INSERT INTO seats (event_id, seat_no)
          VALUES ($1, 'A1'), ($1, 'A2'), ($1, 'A3'), ($1, 'A4'), ($1, 'A5'), ($1, 'CONCURRENT')`,
         [eventId],
@@ -74,6 +78,7 @@ async function main() {
         console.log("Reservation verification passed.");
     } finally {
         await pool.query("DELETE FROM seats WHERE event_id = $1", [eventId]);
+        await pool.query("DELETE FROM events WHERE id = $1", [eventId]);
         await pool.end();
     }
 }

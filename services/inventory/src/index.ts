@@ -7,6 +7,9 @@ import type {
 import { z } from "zod";
 import { pool } from "./db.js";
 import { reserveSeats } from "./reserveSeats.js";
+import { availabilityApp } from "./availabilityApi.js";
+
+const HTTP_PORT = Number(process.env.INVENTORY_HTTP_PORT ?? 3002);
 
 const reserveSeatsCommandSchema = z.object({
     type: z.literal("ReserveSeats"),
@@ -34,6 +37,10 @@ async function main() {
     await consumer.subscribe({
         topic: "inventory.commands",
         fromBeginning: true,
+    });
+
+    availabilityApp.listen(HTTP_PORT, () => {
+        console.log(`Inventory HTTP API listening on port ${HTTP_PORT}`);
     });
 
     console.log("Inventory Service listening for commands...");
