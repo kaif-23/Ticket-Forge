@@ -1,18 +1,13 @@
 import assert from "node:assert/strict";
 import type { AddressInfo } from "node:net";
-import { createBookingApp } from "./bookingApi.js";
-import { pool } from "./db.js";
-import type { ReserveSeatsCommand } from "../../../packages/common/src/messages.js";
+import { createBookingApp } from "../src/bookingApi.js";
+import { pool } from "../src/db.js";
 
 const eventPrefix = `test-booking-${Date.now()}`;
-const publishedCommands: ReserveSeatsCommand[] = [];
-let failPublication = false;
+const triggeredBookingIds: string[] = [];
 
-const app = createBookingApp(async (command) => {
-    if (failPublication) {
-        throw new Error("simulated Kafka failure");
-    }
-    publishedCommands.push(command);
+const app = createBookingApp(async (bookingId) => {
+    triggeredBookingIds.push(bookingId);
 });
 
 async function main() {
@@ -46,13 +41,8 @@ async function main() {
         assert.equal(first.response.status, 202);
         assert.equal(first.body.status, "PENDING");
         assert.equal(typeof first.body.bookingId, "string");
-        assert.equal(publishedCommands.length, 1);
-        assert.deepEqual(publishedCommands[0], {
-            type: "ReserveSeats",
-            bookingId: first.body.bookingId,
-            eventId: `${eventPrefix}-one`,
-            seatNos: ["A1", "A2"],
-        });
+        assert.equal(triggeredBookingIds.length, 1);
+        assert.equal(triggeredBookingIds[0], first.body.bookingId);
 
         const persisted = await pool.query(
             `SELECT id, user_id, event_id, seat_nos, status, idempotency_key, request_hash
@@ -63,6 +53,26 @@ async function main() {
         assert.deepEqual(persisted.rows[0].seat_nos, ["A1", "A2"]);
         assert.ok(persisted.rows[0].request_hash);
 
+        // Verify outbox record created in the same database transaction
+        const outboxResult = await pool.query(
+            `SELECT id, booking_id, topic, type, occurred_at, payload, published_at
+             FROM outbox WHERE booking_id = $1`,
+            [first.body.bookingId],
+        );
+        assert.equal(outboxResult.rows.length, 1);
+        const outboxRow = outboxResult.rows[0];
+        assert.equal(outboxRow.booking_id, first.body.bookingId);
+        assert.equal(outboxRow.type, "ReserveSeats");
+        assert.equal(outboxRow.topic, "inventory.commands");
+        assert.equal(typeof outboxRow.id, "string");
+        assert.ok(outboxRow.occurred_at);
+        assert.deepEqual(outboxRow.payload, {
+            eventId: `${eventPrefix}-one`,
+            seatNos: ["A1", "A2"],
+        });
+        assert.equal(outboxRow.published_at, null);
+
+        // Idempotent replay
         const replay = await postBooking(
             { userId: "user-1", eventId: `${eventPrefix}-one`, seatNos: ["A1", "A2"] },
             "key-1",
@@ -72,14 +82,21 @@ async function main() {
             bookingId: first.body.bookingId,
             status: "PENDING",
         });
-        assert.equal(publishedCommands.length, 1);
+        // Outbox must not have a second record
+        const replayOutbox = await pool.query(
+            `SELECT id FROM outbox WHERE booking_id = $1`,
+            [first.body.bookingId],
+        );
+        assert.equal(replayOutbox.rows.length, 1);
 
+        // Idempotency conflict
         const conflict = await postBooking(
             { userId: "user-1", eventId: `${eventPrefix}-different`, seatNos: ["A1"] },
             "key-1",
         );
         assert.equal(conflict.response.status, 409);
 
+        // Different user with same idempotency key succeeds
         const differentUser = await postBooking(
             { userId: "user-2", eventId: `${eventPrefix}-one`, seatNos: ["A1"] },
             "key-1",
@@ -87,6 +104,13 @@ async function main() {
         assert.equal(differentUser.response.status, 202);
         assert.notEqual(differentUser.body.bookingId, first.body.bookingId);
 
+        const differentUserOutbox = await pool.query(
+            `SELECT id FROM outbox WHERE booking_id = $1`,
+            [differentUser.body.bookingId],
+        );
+        assert.equal(differentUserOutbox.rows.length, 1);
+
+        // Validation errors
         const missingKey = await postBooking({
             userId: "user-3",
             eventId: `${eventPrefix}-invalid`,
@@ -100,6 +124,7 @@ async function main() {
         );
         assert.equal(invalidBody.response.status, 400);
 
+        // Concurrent duplicate requests
         const concurrentResults = await Promise.all(
             Array.from({ length: 8 }, () =>
                 postBooking(
@@ -115,18 +140,12 @@ async function main() {
         assert.equal(concurrentResults.filter((result) => result.response.status === 202).length, 1);
         assert.equal(concurrentResults.filter((result) => result.response.status === 200).length, 7);
 
-        failPublication = true;
-        const publicationFailure = await postBooking(
-            { userId: "user-publish-failure", eventId: `${eventPrefix}-failure`, seatNos: ["A1"] },
-            "key-publish-failure",
+        const concurrentBookingId = [...concurrentBookingIds][0];
+        const concurrentOutbox = await pool.query(
+            `SELECT id FROM outbox WHERE booking_id = $1`,
+            [concurrentBookingId],
         );
-        assert.equal(publicationFailure.response.status, 503);
-        const persistedAfterPublishFailure = await pool.query(
-            "SELECT status FROM bookings WHERE id = $1",
-            [publicationFailure.body.bookingId],
-        );
-        assert.equal(persistedAfterPublishFailure.rows[0].status, "PENDING");
-        failPublication = false;
+        assert.equal(concurrentOutbox.rows.length, 1);
 
         await pool.query("DELETE FROM bookings WHERE event_id LIKE $1", [`${eventPrefix}%`]);
         await pool.end();

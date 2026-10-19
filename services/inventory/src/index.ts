@@ -1,21 +1,35 @@
+import { randomUUID } from "node:crypto";
 import { Kafka } from "kafkajs";
 import type {
+    ConfirmSeatsCommand,
+    ReleaseSeatsCommand,
     ReserveSeatsCommand,
+    SeatsConfirmedEvent,
+    SeatsReleasedEvent,
     SeatsReservationFailedEvent,
     SeatsReservedEvent,
 } from "../../../packages/common/src/messages.js";
 import { z } from "zod";
 import { pool } from "./db.js";
 import { reserveSeats } from "./reserveSeats.js";
+import { confirmSeats } from "./confirmSeats.js";
+import { releaseSeats } from "./releaseSeats.js";
 import { availabilityApp } from "./availabilityApi.js";
+import { ExpirySweeper } from "./expirySweeper.js";
+import { recordProcessedMessage } from "./idempotency.js";
+import { closeRedis } from "./redis.js";
 
 const HTTP_PORT = Number(process.env.INVENTORY_HTTP_PORT ?? 3002);
 
-const reserveSeatsCommandSchema = z.object({
-    type: z.literal("ReserveSeats"),
+const inventoryCommandSchema = z.object({
+    messageId: z.string().min(1),
     bookingId: z.string().min(1),
-    eventId: z.string().min(1),
-    seatNos: z.array(z.string().min(1)).min(1),
+    type: z.enum(["ReserveSeats", "ConfirmSeats", "ReleaseSeats"]),
+    occurredAt: z.string().min(1),
+    payload: z.object({
+        eventId: z.string().min(1),
+        seatNos: z.array(z.string().min(1)).min(1),
+    }),
 });
 
 const kafka = new Kafka({
@@ -28,11 +42,17 @@ const consumer = kafka.consumer({
 });
 
 const producer = kafka.producer();
+const sweeper = new ExpirySweeper(pool, producer, {
+    sweepIntervalMs: Number(process.env.EXPIRY_SWEEPER_INTERVAL_MS ?? 1000),
+});
+
 const result = await pool.query("SELECT NOW() AS current_time");
 console.log("PostgreSQL connected:", result.rows[0]);
 async function main() {
     await producer.connect();
     await consumer.connect();
+
+    sweeper.start();
 
     await consumer.subscribe({
         topic: "inventory.commands",
@@ -70,34 +90,87 @@ async function main() {
                 return;
             }
 
-            const result = reserveSeatsCommandSchema.safeParse(parsedJson);
+            const result = inventoryCommandSchema.safeParse(parsedJson);
 
             if (!result.success) {
-                console.error("Invalid ReserveSeats command:", result.error.issues);
+                console.error("Invalid inventory command:", result.error.issues);
                 return;
             }
 
-            const command: ReserveSeatsCommand = result.data;
+            const command = result.data;
 
-            if (command.type !== "ReserveSeats") {
-                console.log("Ignoring unsupported command:", command.type);
-                return;
-            }
-
+            const client = await pool.connect();
             try {
-                const reservation = await reserveSeats(
-                    command.bookingId,
-                    command.eventId,
-                    command.seatNos,
+                await client.query("BEGIN");
+
+                const { isDuplicate } = await recordProcessedMessage(
+                    client,
+                    command.messageId,
+                    "inventory-service-group",
+                    topic,
                 );
 
-                if (!reservation.success) {
-                    const event: SeatsReservationFailedEvent = {
-                        type: "SeatsReservationFailed",
+                if (isDuplicate) {
+                    await client.query("ROLLBACK");
+                    console.log("Ignored duplicate inventory command:", {
+                        messageId: command.messageId,
                         bookingId: command.bookingId,
-                        eventId: command.eventId,
-                        seatNos: command.seatNos,
-                        reason: reservation.reason,
+                        type: command.type,
+                    });
+                    return;
+                }
+
+                if (command.type === "ReserveSeats") {
+                    const reservation = await reserveSeats(
+                        command.bookingId,
+                        command.payload.eventId,
+                        command.payload.seatNos,
+                        client,
+                    );
+
+                    await client.query("COMMIT");
+
+                    if (!reservation.success) {
+                        const event: SeatsReservationFailedEvent = {
+                            messageId: randomUUID(),
+                            bookingId: command.bookingId,
+                            type: "SeatsReservationFailed",
+                            occurredAt: new Date().toISOString(),
+                            payload: {
+                                eventId: command.payload.eventId,
+                                seatNos: command.payload.seatNos,
+                                reason: reservation.reason as "SEAT_UNAVAILABLE",
+                            },
+                        };
+
+                        await producer.send({
+                            topic: "inventory.events",
+                            messages: [
+                                {
+                                    key: command.bookingId,
+                                    value: JSON.stringify(event),
+                                },
+                            ],
+                        });
+
+                        console.log("Published inventory reservation result:", {
+                            bookingId: command.bookingId,
+                            eventId: command.payload.eventId,
+                            seatNos: command.payload.seatNos,
+                            result: reservation.reason,
+                        });
+                        return;
+                    }
+
+                    const event: SeatsReservedEvent = {
+                        messageId: randomUUID(),
+                        bookingId: command.bookingId,
+                        type: "SeatsReserved",
+                        occurredAt: new Date().toISOString(),
+                        payload: {
+                            eventId: command.payload.eventId,
+                            seatNos: command.payload.seatNos,
+                        },
                     };
 
                     await producer.send({
@@ -112,44 +185,120 @@ async function main() {
 
                     console.log("Published inventory reservation result:", {
                         bookingId: command.bookingId,
-                        eventId: command.eventId,
-                        seatNos: command.seatNos,
-                        result: reservation.reason,
+                        eventId: command.payload.eventId,
+                        seatNos: command.payload.seatNos,
+                        result: "RESERVED",
                     });
                     return;
                 }
 
-                const event: SeatsReservedEvent = {
-                    type: "SeatsReserved",
-                    bookingId: command.bookingId,
-                    eventId: command.eventId,
-                    seatNos: command.seatNos,
-                };
+                if (command.type === "ConfirmSeats") {
+                    const confirmation = await confirmSeats(
+                        command.bookingId,
+                        command.payload.eventId,
+                        command.payload.seatNos,
+                        client,
+                    );
 
-                await producer.send({
-                    topic: "inventory.events",
-                    messages: [
-                        {
-                            key: command.bookingId,
-                            value: JSON.stringify(event),
+                    if (!confirmation.success) {
+                        await client.query("ROLLBACK");
+                        console.error("Seats confirmation failed in inventory:", {
+                            bookingId: command.bookingId,
+                            reason: confirmation.reason,
+                        });
+                        return;
+                    }
+
+                    await client.query("COMMIT");
+
+                    const event: SeatsConfirmedEvent = {
+                        messageId: randomUUID(),
+                        bookingId: command.bookingId,
+                        type: "SeatsConfirmed",
+                        occurredAt: new Date().toISOString(),
+                        payload: {
+                            eventId: command.payload.eventId,
+                            seatNos: command.payload.seatNos,
                         },
-                    ],
-                });
+                    };
 
-                console.log("Published inventory reservation result:", {
-                    bookingId: command.bookingId,
-                    eventId: command.eventId,
-                    seatNos: command.seatNos,
-                    result: "RESERVED",
-                });
+                    await producer.send({
+                        topic: "inventory.events",
+                        messages: [
+                            {
+                                key: command.bookingId,
+                                value: JSON.stringify(event),
+                            },
+                        ],
+                    });
+
+                    console.log("Published inventory confirmation result:", {
+                        bookingId: command.bookingId,
+                        result: "CONFIRMED",
+                    });
+                    return;
+                }
+
+                if (command.type === "ReleaseSeats") {
+                    const release = await releaseSeats(
+                        command.bookingId,
+                        command.payload.eventId,
+                        command.payload.seatNos,
+                        client,
+                    );
+
+                    if (!release.success) {
+                        await client.query("ROLLBACK");
+                        console.error("Seats release failed in inventory:", {
+                            bookingId: command.bookingId,
+                            reason: release.reason,
+                        });
+                        return;
+                    }
+
+                    await client.query("COMMIT");
+
+                    const event: SeatsReleasedEvent = {
+                        messageId: randomUUID(),
+                        bookingId: command.bookingId,
+                        type: "SeatsReleased",
+                        occurredAt: new Date().toISOString(),
+                        payload: {
+                            eventId: command.payload.eventId,
+                            seatNos: command.payload.seatNos,
+                        },
+                    };
+
+                    await producer.send({
+                        topic: "inventory.events",
+                        messages: [
+                            {
+                                key: command.bookingId,
+                                value: JSON.stringify(event),
+                            },
+                        ],
+                    });
+
+                    console.log("Published inventory release result:", {
+                        bookingId: command.bookingId,
+                        result: "RELEASED",
+                    });
+                    return;
+                }
             } catch (error) {
-                console.error("Inventory reservation processing failed:", {
+                try {
+                    await client.query("ROLLBACK");
+                } catch {
+                    // ignore rollback error
+                }
+                console.error("Inventory command processing failed:", {
                     bookingId: command.bookingId,
-                    eventId: command.eventId,
-                    seatNos: command.seatNos,
+                    commandType: command.type,
                     error,
                 });
                 throw error;
+            } finally {
+                client.release();
             }
         },
     });
@@ -157,7 +306,29 @@ async function main() {
 
 main().catch(async (error) => {
     console.error("Inventory Service error:", error);
-    await consumer.disconnect();
-    await producer.disconnect();
+    try {
+        await sweeper.stop();
+        await consumer.disconnect();
+        await producer.disconnect();
+        await closeRedis();
+    } catch {
+        // ignore errors during fatal shutdown
+    }
     process.exit(1);
 });
+
+const shutdown = async (signal: string) => {
+    console.log(`Received ${signal}, shutting down Inventory service...`);
+    try {
+        await sweeper.stop();
+        await consumer.disconnect();
+        await producer.disconnect();
+        await closeRedis();
+    } catch (err) {
+        console.error("Error during inventory shutdown:", err);
+    }
+    process.exit(0);
+};
+
+process.on("SIGINT", () => void shutdown("SIGINT"));
+process.on("SIGTERM", () => void shutdown("SIGTERM"));

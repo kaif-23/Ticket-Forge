@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import type { AddressInfo } from "node:net";
-import { availabilityApp } from "./availabilityApi.js";
-import { pool } from "./db.js";
-import { confirmSeats } from "./confirmSeats.js";
-import { reserveSeats } from "./reserveSeats.js";
+import { availabilityApp } from "../src/availabilityApi.js";
+import { pool } from "../src/db.js";
+import { confirmSeats } from "../src/confirmSeats.js";
+import { reserveSeats } from "../src/reserveSeats.js";
 
 const eventId = `test-availability-${Date.now()}`;
 

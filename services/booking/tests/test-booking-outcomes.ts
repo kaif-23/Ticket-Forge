@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { applyInventoryOutcome, InvalidInventoryEventError } from "./bookingEvents.js";
-import { pool } from "./db.js";
+import { applyInventoryOutcome, InvalidInventoryEventError } from "../src/bookingEvents.js";
+import { pool } from "../src/db.js";
 
 const eventPrefix = `test-outcomes-${Date.now()}`;
 const bookingIds = {
@@ -49,10 +49,14 @@ async function main() {
 
     try {
         const success = await applyInventoryOutcome({
+            messageId: "msg-1",
+            occurredAt: "2026-10-10T00:00:00Z",
             type: "SeatsReserved",
             bookingId: bookingIds.success,
-            eventId: `${eventPrefix}-event`,
-            seatNos: ["A2", "A1"],
+            payload: {
+                eventId: `${eventPrefix}-event`,
+                seatNos: ["A2", "A1"],
+            }
         });
         assert.deepEqual(success, {
             kind: "updated",
@@ -64,11 +68,15 @@ async function main() {
         assert.ok(successfulBooking.updated_at > new Date("2000-01-01T00:00:00Z"));
 
         const failure = await applyInventoryOutcome({
+            messageId: "msg-2",
+            occurredAt: "2026-10-10T00:00:00Z",
             type: "SeatsReservationFailed",
             bookingId: bookingIds.failure,
-            eventId: `${eventPrefix}-event`,
-            seatNos: ["B1"],
-            reason: "SEAT_UNAVAILABLE",
+            payload: {
+                eventId: `${eventPrefix}-event`,
+                seatNos: ["B1"],
+                reason: "SEAT_UNAVAILABLE",
+            }
         });
         assert.deepEqual(failure, {
             kind: "updated",
@@ -77,10 +85,14 @@ async function main() {
         });
 
         const unknown = await applyInventoryOutcome({
+            messageId: "msg-3",
+            occurredAt: "2026-10-10T00:00:00Z",
             type: "SeatsReserved",
             bookingId: `${eventPrefix}-unknown`,
-            eventId: `${eventPrefix}-event`,
-            seatNos: ["UNKNOWN"],
+            payload: {
+                eventId: `${eventPrefix}-event`,
+                seatNos: ["UNKNOWN"],
+            }
         });
         assert.deepEqual(unknown, {
             kind: "unknown",
@@ -93,10 +105,14 @@ async function main() {
         assert.equal(unknownCount.rows[0].count, 0);
 
         const repeatedSuccess = await applyInventoryOutcome({
+            messageId: "msg-4",
+            occurredAt: "2026-10-10T00:00:00Z",
             type: "SeatsReserved",
             bookingId: bookingIds.success,
-            eventId: `${eventPrefix}-event`,
-            seatNos: ["A1", "A2"],
+            payload: {
+                eventId: `${eventPrefix}-event`,
+                seatNos: ["A1", "A2"],
+            }
         });
         assert.deepEqual(repeatedSuccess, {
             kind: "stale",
@@ -105,11 +121,15 @@ async function main() {
         });
 
         const repeatedFailure = await applyInventoryOutcome({
+            messageId: "msg-5",
+            occurredAt: "2026-10-10T00:00:00Z",
             type: "SeatsReservationFailed",
             bookingId: bookingIds.failure,
-            eventId: `${eventPrefix}-event`,
-            seatNos: ["B1"],
-            reason: "SEAT_UNAVAILABLE",
+            payload: {
+                eventId: `${eventPrefix}-event`,
+                seatNos: ["B1"],
+                reason: "SEAT_UNAVAILABLE",
+            }
         });
         assert.deepEqual(repeatedFailure, {
             kind: "stale",
@@ -118,10 +138,14 @@ async function main() {
         });
 
         const staleSuccess = await applyInventoryOutcome({
+            messageId: "msg-6",
+            occurredAt: "2026-10-10T00:00:00Z",
             type: "SeatsReserved",
             bookingId: bookingIds.cancelled,
-            eventId: `${eventPrefix}-event`,
-            seatNos: ["C1"],
+            payload: {
+                eventId: `${eventPrefix}-event`,
+                seatNos: ["C1"],
+            }
         });
         assert.deepEqual(staleSuccess, {
             kind: "stale",
@@ -130,11 +154,15 @@ async function main() {
         });
 
         const staleFailure = await applyInventoryOutcome({
+            messageId: "msg-7",
+            occurredAt: "2026-10-10T00:00:00Z",
             type: "SeatsReservationFailed",
             bookingId: bookingIds.held,
-            eventId: `${eventPrefix}-event`,
-            seatNos: ["D1"],
-            reason: "SEAT_UNAVAILABLE",
+            payload: {
+                eventId: `${eventPrefix}-event`,
+                seatNos: ["D1"],
+                reason: "SEAT_UNAVAILABLE",
+            }
         });
         assert.deepEqual(staleFailure, {
             kind: "stale",
@@ -143,10 +171,14 @@ async function main() {
         });
 
         const mismatchedEvent = await applyInventoryOutcome({
+            messageId: "msg-8",
+            occurredAt: "2026-10-10T00:00:00Z",
             type: "SeatsReserved",
             bookingId: bookingIds.success,
-            eventId: `${eventPrefix}-wrong-event`,
-            seatNos: ["A1", "A2"],
+            payload: {
+                eventId: `${eventPrefix}-wrong-event`,
+                seatNos: ["A1", "A2"],
+            }
         });
         assert.deepEqual(mismatchedEvent, {
             kind: "stale",
@@ -159,17 +191,25 @@ async function main() {
             {},
             { type: "SeatsReserved", bookingId: bookingIds.success },
             {
+                messageId: "msg-9",
+                occurredAt: "2026-10-10T00:00:00Z",
                 type: "SeatsReservationFailed",
                 bookingId: bookingIds.success,
-                eventId: `${eventPrefix}-event`,
-                seatNos: ["A1"],
-                reason: "OTHER",
+                payload: {
+                    eventId: `${eventPrefix}-event`,
+                    seatNos: ["A1"],
+                    reason: "OTHER",
+                }
             },
             {
+                messageId: "msg-10",
+                occurredAt: "2026-10-10T00:00:00Z",
                 type: "SeatsReserved",
                 bookingId: bookingIds.success,
-                eventId: `${eventPrefix}-event`,
-                seatNos: ["A1", "A1"],
+                payload: {
+                    eventId: `${eventPrefix}-event`,
+                    seatNos: ["A1", "A1"],
+                }
             },
         ]) {
             await assert.rejects(
@@ -184,10 +224,14 @@ async function main() {
         await assert.rejects(
             () =>
                 applyInventoryOutcome({
+                    messageId: "msg-11",
+                    occurredAt: "2026-10-10T00:00:00Z",
                     type: "SeatsReserved",
                     bookingId: bookingIds.success,
-                    eventId: `${eventPrefix}-event`,
-                    seatNos: ["A1", "A2"],
+                    payload: {
+                        eventId: `${eventPrefix}-event`,
+                        seatNos: ["A1", "A2"],
+                    }
                 }),
             /pool after calling end/,
         );

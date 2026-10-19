@@ -1,5 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
+import type { PoolClient } from "pg";
 import { pool } from "./db.js";
+import { insertOutboxRecord } from "./outbox.js";
+import { recordSagaStep } from "./sagaLog.js";
+import type {
+    ProcessPaymentCommand,
+    ReserveSeatsCommand,
+} from "../../../packages/common/src/messages.js";
 
 export type BookingStatus =
     | "PENDING"
@@ -122,10 +129,35 @@ export async function getBookingById(bookingId: string): Promise<BookingRecord |
     return result.rows.length === 0 ? null : rowToBooking(result.rows[0]);
 }
 
+export interface BookingCreationResult {
+    booking: BookingRecord;
+    created: boolean;
+    outboxRecord?: {
+        id: string;
+        bookingId: string;
+        topic: string;
+        type: string;
+        occurredAt: string;
+        payload: {
+            eventId: string;
+            seatNos: string[];
+        };
+    };
+}
+
+export interface CreateBookingOptions {
+    outboxInserter?: (
+        client: PoolClient,
+        booking: BookingRecord,
+        command: ReserveSeatsCommand,
+    ) => Promise<void>;
+}
+
 export async function createOrGetBooking(
     request: BookingRequest,
     idempotencyKey: string,
-): Promise<{ booking: BookingRecord; created: boolean }> {
+    options?: CreateBookingOptions,
+): Promise<BookingCreationResult> {
     const client = await pool.connect();
     const requestHash = calculateRequestHash(request);
 
@@ -152,8 +184,56 @@ export async function createOrGetBooking(
         );
 
         if (insertResult.rows.length > 0) {
+            const booking = rowToBooking(insertResult.rows[0]);
+            const messageId = randomUUID();
+            const occurredAt = new Date().toISOString();
+            const command: ReserveSeatsCommand = {
+                messageId,
+                bookingId: booking.id,
+                type: "ReserveSeats",
+                occurredAt,
+                payload: {
+                    eventId: booking.eventId,
+                    seatNos: booking.seatNos,
+                },
+            };
+
+            if (options?.outboxInserter) {
+                await options.outboxInserter(client, booking, command);
+            } else {
+                await insertOutboxRecord(client, {
+                    id: command.messageId,
+                    bookingId: command.bookingId,
+                    topic: "inventory.commands",
+                    type: command.type,
+                    occurredAt: command.occurredAt,
+                    payload: command.payload,
+                });
+            }
+
+            await recordSagaStep(client, {
+                bookingId: booking.id,
+                state: "PENDING",
+                lastEvent: "BookingCreated",
+                payload: {
+                    eventId: booking.eventId,
+                    seatNos: booking.seatNos,
+                },
+            });
+
             await client.query("COMMIT");
-            return { booking: rowToBooking(insertResult.rows[0]), created: true };
+            return {
+                booking,
+                created: true,
+                outboxRecord: {
+                    id: command.messageId,
+                    bookingId: command.bookingId,
+                    topic: "inventory.commands",
+                    type: command.type,
+                    occurredAt: command.occurredAt,
+                    payload: command.payload,
+                },
+            };
         }
 
         const existingResult = await client.query(
@@ -188,3 +268,160 @@ export async function createOrGetBooking(
         client.release();
     }
 }
+
+export class BookingNotFoundError extends Error {
+    constructor() {
+        super("Booking not found");
+        this.name = "BookingNotFoundError";
+    }
+}
+
+export class InvalidBookingStateError extends Error {
+    constructor(currentState: string, expectedState: string) {
+        super(`Cannot perform payment on booking in state ${currentState}; expected ${expectedState}`);
+        this.name = "InvalidBookingStateError";
+    }
+}
+
+export interface PayBookingResult {
+    bookingId: string;
+    status: BookingStatus;
+    duplicate?: boolean;
+    outboxRecord?: {
+        id: string;
+        bookingId: string;
+        topic: string;
+        type: string;
+        occurredAt: string;
+        payload: { amount: number; currency?: string };
+    };
+}
+
+export async function payBooking(
+    bookingId: string,
+    options?: { amount?: number; currency?: string },
+): Promise<PayBookingResult> {
+    if (!bookingId || !isValidBookingId(bookingId)) {
+        throw new InvalidBookingIdError();
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query("BEGIN");
+
+        const result = await client.query(
+            `SELECT id, user_id, event_id, seat_nos, status, idempotency_key, request_hash, created_at, updated_at
+             FROM bookings
+             WHERE id = $1
+             FOR UPDATE`,
+            [bookingId],
+        );
+
+        if (result.rows.length === 0) {
+            await client.query("ROLLBACK");
+            throw new BookingNotFoundError();
+        }
+
+        const booking = rowToBooking(result.rows[0]);
+        if (booking.status === "PAID" || booking.status === "CONFIRMED") {
+            await client.query("COMMIT");
+            return {
+                bookingId,
+                status: booking.status,
+                duplicate: true,
+            };
+        }
+
+        if (booking.status !== "SEATS_HELD") {
+            await client.query("ROLLBACK");
+            throw new InvalidBookingStateError(booking.status, "SEATS_HELD");
+        }
+
+        const existingOutbox = await client.query(
+            `SELECT id, topic, type, occurred_at, payload
+             FROM outbox
+             WHERE booking_id = $1 AND type = 'ProcessPayment'
+             ORDER BY created_at DESC
+             LIMIT 1`,
+            [bookingId],
+        );
+
+        if (existingOutbox.rows.length > 0) {
+            await client.query("COMMIT");
+            const existing = existingOutbox.rows[0];
+            return {
+                bookingId,
+                status: "SEATS_HELD",
+                duplicate: true,
+                outboxRecord: {
+                    id: existing.id,
+                    bookingId,
+                    topic: existing.topic,
+                    type: existing.type,
+                    occurredAt:
+                        existing.occurred_at instanceof Date
+                            ? existing.occurred_at.toISOString()
+                            : String(existing.occurred_at),
+                    payload: existing.payload,
+                },
+            };
+        }
+
+        const messageId = randomUUID();
+        const occurredAt = new Date().toISOString();
+        const amount = options?.amount ?? 100;
+        const payload: { amount: number; currency?: string } = {
+            amount,
+            ...(options?.currency ? { currency: options.currency } : {}),
+        };
+
+        const command: ProcessPaymentCommand = {
+            messageId,
+            bookingId,
+            type: "ProcessPayment",
+            occurredAt,
+            payload,
+        };
+
+        await insertOutboxRecord(client, {
+            id: command.messageId,
+            bookingId: command.bookingId,
+            topic: "payment.commands",
+            type: command.type,
+            occurredAt: command.occurredAt,
+            payload: command.payload,
+        });
+
+        await recordSagaStep(client, {
+            bookingId,
+            state: "SEATS_HELD",
+            lastEvent: "ProcessPayment",
+            payload: command.payload,
+        });
+
+        await client.query("COMMIT");
+
+        return {
+            bookingId,
+            status: "SEATS_HELD",
+            outboxRecord: {
+                id: command.messageId,
+                bookingId: command.bookingId,
+                topic: "payment.commands",
+                type: command.type,
+                occurredAt: command.occurredAt,
+                payload,
+            },
+        };
+    } catch (error) {
+        try {
+            await client.query("ROLLBACK");
+        } catch {
+            // Preserve original error
+        }
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+

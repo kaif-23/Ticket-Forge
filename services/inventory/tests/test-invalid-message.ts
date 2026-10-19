@@ -12,10 +12,14 @@ async function main() {
     await producer.connect();
 
     const invalidCommand = {
+        messageId: "msg-invalid",
+        occurredAt: "2026-10-10T00:00:00Z",
         type: "ReserveSeats",
         bookingId: 123,
-        eventId: "event-1",
-        seatNos: "A1",
+        payload: {
+            eventId: "event-1",
+            seatNos: "A1",
+        }
     };
 
     await producer.send({

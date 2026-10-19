@@ -1,3 +1,4 @@
+import type { PoolClient } from "pg";
 import { pool } from "./db.js";
 
 export type ConfirmSeatsResult =
@@ -8,6 +9,7 @@ export async function confirmSeats(
     bookingId: string,
     eventId: string,
     seatNos: string[],
+    client?: PoolClient,
 ): Promise<ConfirmSeatsResult> {
     const uniqueSeatNos = [...new Set(seatNos)];
 
@@ -15,14 +17,16 @@ export async function confirmSeats(
         return { success: false, reason: "SEAT_UNAVAILABLE" };
     }
 
-    const client = await pool.connect();
+    const localClient = client ?? (await pool.connect());
     let transactionActive = false;
 
     try {
-        await client.query("BEGIN");
-        transactionActive = true;
+        if (!client) {
+            await localClient.query("BEGIN");
+            transactionActive = true;
+        }
 
-        const result = await client.query<{ seat_no: string }>(
+        const result = await localClient.query<{ seat_no: string }>(
             `UPDATE seats
        SET status = 'SOLD',
            held_by_booking = NULL,
@@ -38,18 +42,22 @@ export async function confirmSeats(
         );
 
         if (result.rowCount !== uniqueSeatNos.length) {
-            await client.query("ROLLBACK");
-            transactionActive = false;
+            if (!client && transactionActive) {
+                await localClient.query("ROLLBACK");
+                transactionActive = false;
+            }
             return { success: false, reason: "SEAT_UNAVAILABLE" };
         }
 
-        await client.query("COMMIT");
-        transactionActive = false;
+        if (!client) {
+            await localClient.query("COMMIT");
+            transactionActive = false;
+        }
         return { success: true };
     } catch (error) {
-        if (transactionActive) {
+        if (!client && transactionActive) {
             try {
-                await client.query("ROLLBACK");
+                await localClient.query("ROLLBACK");
             } catch {
                 // Preserve the original database error.
             }
@@ -57,6 +65,8 @@ export async function confirmSeats(
 
         throw error;
     } finally {
-        client.release();
+        if (!client) {
+            localClient.release();
+        }
     }
 }

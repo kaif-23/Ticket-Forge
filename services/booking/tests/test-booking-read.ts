@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import type { AddressInfo } from "node:net";
-import { createBookingApp } from "./bookingApi.js";
-import { pool } from "./db.js";
+import { createBookingApp } from "../src/bookingApi.js";
+import { pool } from "../src/db.js";
 
 const bookingId = randomUUID();
 const eventId = `test-read-event-${Date.now()}`;

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import type { AddressInfo } from "node:net";
-import { availabilityApp } from "./availabilityApi.js";
-import { pool } from "./db.js";
+import { availabilityApp } from "../src/availabilityApi.js";
+import { pool } from "../src/db.js";
 
 const eventId = `test-event-api-${Date.now()}`;
 

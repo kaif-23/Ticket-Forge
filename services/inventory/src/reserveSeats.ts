@@ -1,14 +1,25 @@
 import type { PoolClient } from "pg";
+import type { Redis } from "ioredis";
 import { pool } from "./db.js";
+import { acquireSeatLocks, releaseSeatLocks } from "./seatLock.js";
 
 export type ReserveSeatsResult =
     | { success: true }
     | { success: false; reason: "SEAT_UNAVAILABLE" };
 
+export interface ReserveSeatsOptions {
+    skipRedisLock?: boolean;
+    lockTtlMs?: number;
+    redisClient?: Redis;
+    releaseLockOnSuccess?: boolean;
+}
+
 export async function reserveSeats(
     bookingId: string,
     eventId: string,
     seatNos: string[],
+    client?: PoolClient,
+    options?: ReserveSeatsOptions,
 ): Promise<ReserveSeatsResult> {
     const uniqueSeatNos = [...new Set(seatNos)];
 
@@ -16,14 +27,33 @@ export async function reserveSeats(
         return { success: false, reason: "SEAT_UNAVAILABLE" };
     }
 
-    const client = await pool.connect();
+    let lockAcquired = false;
+    if (!options?.skipRedisLock) {
+        const lockResult = await acquireSeatLocks(
+            eventId,
+            uniqueSeatNos,
+            bookingId,
+            options?.lockTtlMs,
+            options?.redisClient,
+        );
+
+        if (!lockResult.acquired && !lockResult.redisBypassed) {
+            // Fast-path rejection: Diverts competing traffic without touching PostgreSQL
+            return { success: false, reason: "SEAT_UNAVAILABLE" };
+        }
+        lockAcquired = lockResult.acquired && !lockResult.redisBypassed;
+    }
+
+    const localClient = client ?? (await pool.connect());
     let transactionActive = false;
 
     try {
-        await client.query("BEGIN");
-        transactionActive = true;
+        if (!client) {
+            await localClient.query("BEGIN");
+            transactionActive = true;
+        }
 
-        const result = await client.query<{ seat_no: string }>(
+        const result = await localClient.query<{ seat_no: string }>(
             `UPDATE seats
        SET status = 'HELD',
            held_by_booking = $1,
@@ -37,25 +67,42 @@ export async function reserveSeats(
         );
 
         if (result.rowCount !== uniqueSeatNos.length) {
-            await client.query("ROLLBACK");
-            transactionActive = false;
+            if (!client && transactionActive) {
+                await localClient.query("ROLLBACK");
+                transactionActive = false;
+            }
+            if (lockAcquired) {
+                await releaseSeatLocks(eventId, uniqueSeatNos, bookingId, options?.redisClient);
+            }
             return { success: false, reason: "SEAT_UNAVAILABLE" };
         }
 
-        await client.query("COMMIT");
-        transactionActive = false;
+        if (!client) {
+            await localClient.query("COMMIT");
+            transactionActive = false;
+        }
+
+        if (lockAcquired && (options?.releaseLockOnSuccess ?? true)) {
+            await releaseSeatLocks(eventId, uniqueSeatNos, bookingId, options?.redisClient);
+        }
+
         return { success: true };
     } catch (error) {
-        if (transactionActive) {
+        if (!client && transactionActive) {
             try {
-                await client.query("ROLLBACK");
+                await localClient.query("ROLLBACK");
             } catch {
                 // Preserve the original database error.
             }
         }
+        if (lockAcquired) {
+            await releaseSeatLocks(eventId, uniqueSeatNos, bookingId, options?.redisClient);
+        }
 
         throw error;
     } finally {
-        client.release();
+        if (!client) {
+            localClient.release();
+        }
     }
 }

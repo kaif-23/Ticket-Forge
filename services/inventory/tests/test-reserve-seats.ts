@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { pool } from "./db.js";
-import { reserveSeats } from "./reserveSeats.js";
+import { pool } from "../src/db.js";
+import { reserveSeats } from "../src/reserveSeats.js";
 
 const eventId = `test-event-${Date.now()}`;
 

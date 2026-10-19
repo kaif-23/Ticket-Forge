@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
-import { confirmSeats } from "./confirmSeats.js";
-import { expireHeldSeats } from "./expireSeats.js";
-import { pool } from "./db.js";
-import { reserveSeats } from "./reserveSeats.js";
+import { confirmSeats } from "../src/confirmSeats.js";
+import { expireHeldSeats } from "../src/expireSeats.js";
+import { pool } from "../src/db.js";
+import { reserveSeats } from "../src/reserveSeats.js";
 
 const eventId = `test-expiry-${Date.now()}`;
 
